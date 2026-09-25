@@ -23,6 +23,7 @@ Typical processing includes:
 * Renaming and standardizing columns
 * Joining and transforming related datasets
 * Applying business and technical transformations
+* SCD type 2 load methods
 
 The goal of the Silver layer is to provide **consistent and reliable datasets** that are ready for further business processing.
 
