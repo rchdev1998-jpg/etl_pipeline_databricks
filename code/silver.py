@@ -2,10 +2,10 @@ from pyspark.sql import functions as F
 from pyspark.sql import SparkSession
 from delta.tables import DeltaTable
 from datetime import datetime
-import silver_config
-
-
-
+from silver_config import transformation_config
+from log import logs_summary
+from datetime import datetime
+import uuid
 
 
 def add_hash(df, compare_columns):
@@ -30,9 +30,12 @@ def add_hash(df, compare_columns):
 
 def silver_process(spark):
 
-    for item in silver_config.transformation_config:
+    for item in transformation_config:
     
         print(f">>>TABLE NAME: {item['target_table']}")
+
+        run_id = str(uuid.uuid4())
+        start_time = datetime.now()
 
         # -----------------------------------------
         # Extract + Transform
@@ -54,14 +57,25 @@ def silver_process(spark):
                     bronze_transformed_df,item["compare_columns"])
 
                 scd_two(
+                    spark,
                     item["target_table"],
                     bronze_transformed_df,
                     item["table_key"]
                 )
-                print(f">>>STATUS: SUCCESS")
+
+                print(f"PROCESS: TRANSFORMATION | TABLE NAME: {item["target_table"]} | STATUSL: SUCCESS")
                 print("------------------------------------")
-            except Exception:
-                print(f">>>STATUS: FAILED")
+
+                end_time = datetime.now()
+                duration = (end_time - start_time).total_seconds()
+
+                logs_summary(spark, run_id, item["source_table"], "SILVER", item["target_table"], "TRANSFORMATION", "SUCCESS", start_time, end_time, duration, None)
+
+            except Exception as e:
+
+                print(f"PROCESS: TRANSFORMATION | TABLE NAME: {item["target_table"]} | STATUSL: FAILED")
+
+                logs_summary(spark, run_id, item["source_table"], "SILVER", item["target_table"], "TRANSFORMATION", "FAILED", start_time, end_time, duration, str(e))
                 raise
 
 
@@ -69,6 +83,7 @@ def silver_process(spark):
             print(">>>LOAD TYPE: OVERWRTIE")
             try:
                 overwrite(
+                    spark,
                     item["target_table"],
                     bronze_transformed_df
                 )
@@ -80,10 +95,11 @@ def silver_process(spark):
 
 
 
-def scd_two(target_table, bronze_transformed_df, table_key):
+def scd_two(spark,target_table, bronze_transformed_df, table_key):
     
     # incoming_df - Is a data comming from bronze layer
     # existing_df - Is a data that is already in the silver layer
+    changes = False
 
     silver_transformed_df = spark.sql(f"select * from {target_table}")
 
@@ -97,39 +113,47 @@ def scd_two(target_table, bronze_transformed_df, table_key):
         )
     )
 
-    # --------------------------------------------------
-    # 1. NEW RECORDS
-    # --------------------------------------------------
-    new_df = (
-        joined_df
-        .filter(F.col(f"b.{table_key}").isNull())
-        .select("a.*")
-        .withColumn("is_active", F.lit(True))
-        .withColumn("date_activated", F.current_timestamp())
-        .withColumn("date_deactivated", F.lit(None).cast("timestamp"))
-    )
-
-    if not new_df.isEmpty():
-        print(">>>>>NEW RECORDS")
-        new_df.write.mode("append").saveAsTable(target_table)
 
     # --------------------------------------------------
     # 2. CHANGED RECORDS
     # --------------------------------------------------
-    changed_df = joined_df.filter(
-        (F.col(f"b.{table_key}").isNotNull()) &
-        (F.col("a.hash_code").isNotNull()) &
-        (F.col("a.hash_code") != F.col("b.hash_code"))
+    changed_df = (
+        joined_df.filter(
+            (F.col(f"b.{table_key}").isNotNull()) &
+            (F.col("a.hash_code").isNotNull()) &
+            (F.col("a.hash_code") != F.col("b.hash_code"))
+        )
+        .select("a.*")
     )
 
+    changed_count = changed_df.count() 
+    print(f"changed_df count: {changed_count}")
+
     if not changed_df.isEmpty():
+        changes = True
+
+        # 2. INSERT 
+        new_version = (
+            changed_df
+            .withColumn("is_active", F.lit(True))
+            .withColumn("date_activated", F.current_timestamp())
+            .withColumn("date_deactivated", F.lit(None).cast("timestamp"))
+        )
+        
+        new_count = new_version.count()
+        print(f"new version: {new_count}")
+
+        # -------------------------------------------------------------------------
+
+
         print(">>>>>CHANGED RECORDS")
         target = DeltaTable.forName(
                 spark,
                 target_table
         )
+
         # 1. UPDATE 
-        print(">>>UPDATE THE OLD RECORD")
+        print("---UPDATE OLD RECORD (is_active = false, date-deactivated = timestamp())")
         (
             target.alias("b").merge(changed_df.select("a.*").alias("a")
             ,f"""b.{table_key} = a.{table_key} and b.is_active = true """
@@ -141,18 +165,28 @@ def scd_two(target_table, bronze_transformed_df, table_key):
             ).execute()
         )
 
-        # 2. INSERT 
-        new_version = (
-            changed_df.select("a.*").alias("a")
-            .withColumn("is_active", F.lit(True))
-            .withColumn("date_activated", F.current_timestamp())
-            .withColumn("date_deactivated", F.lit(None).cast("timestamp"))
+    # --------------------------------------------------
+    # 1. NEW RECORDS
+    # --------------------------------------------------
+    new_df = (
+        joined_df
+        .filter(
+            (F.col(f"b.{table_key}").isNull()) |
+           (F.col(f"a.hash_code") != F.col(f"b.hash_code"))
         )
-        
-        if not new_version.isEmpty():
-            print(">>>INSERT NEW")
-            new_version.write.format("delta").mode("append").saveAsTable(target_table)
-        # -------------------------------------------------------------------------
+        .select("a.*")
+        .withColumn("is_active", F.lit(True))
+        .withColumn("date_activated", F.current_timestamp())
+        .withColumn("date_deactivated", F.lit(None).cast("timestamp")
+        )
+    )
+
+    print(f"new_df: {new_df.count()}")
+
+    if not new_df.isEmpty():
+        changes = True
+        print(">>>>>NEW RECORDS")
+        new_df.write.mode("append").saveAsTable(target_table)
 
     # --------------------------------------------------
     # UNCHANGED
@@ -163,10 +197,12 @@ def scd_two(target_table, bronze_transformed_df, table_key):
 
     # if not unchanged_df.isEmpty():
     #     print(">>>>>NO NEW AND CHANGED RECORDS")
+    if changes == False:
+        print(">>>>>NO CHANGES")
     
 
 
-def overwrite(target_table, transformation):
+def overwrite(spark, target_table, transformation):
 
     transformation.write \
         .format("delta") \
