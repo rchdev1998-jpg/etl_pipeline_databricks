@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from log import logs_summary
+from log import logs_summary, logs_detailed
 from datetime import datetime
 import bronze_config
 import uuid
@@ -11,21 +11,32 @@ def bronze_process(spark):
         
         run_id = str(uuid.uuid4())
         start_time = datetime.now()
-
+        end_time = None
+        duration = None
         try:
 
-            df = (
-                spark.read
-                .option("header", "true")
-                .option("inferSchema", "true")
-                .csv(item["file_path"])
-            )
-
-            (
-                df.write
-                .mode("overwrite")
-                .saveAsTable(f"workspace.bronze.{item["target_table"]}")
-            )
+            try:
+                df = (
+                    spark.read
+                    .option("header", "true")
+                    .option("inferSchema", "true")
+                    .csv(item["file_path"])
+                )
+                logs_detailed(spark, run_id, "EXTRACT", df.count(), "SUCCESS", f"Extract from source {item["source"]} to target table {item["target_table"]}")
+            except Exception as e:
+                logs_detailed(spark, run_id, "EXTRACT", df.count(), "FAILED", f"ERROR: {str(e)}")
+                raise
+            
+            try:
+                (
+                    df.write
+                    .mode("overwrite")
+                    .saveAsTable(f"workspace.bronze.{item["target_table"]}")
+                )
+                logs_detailed(spark, run_id, "LOAD", df.count(), "SUCCESS", f"Load from source {item["source"]} to target table {item["target_table"]}")
+            except Exception as e:
+                logs_detailed(spark, run_id, "LOAD", df.count(), "FAILED", f"ERROR: {str(e)}")
+                raise
 
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
