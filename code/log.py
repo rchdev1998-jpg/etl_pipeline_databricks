@@ -43,26 +43,29 @@ def logs_summary(spark, run_id, source, schema, table_name, process, status, sta
 
         print(f"etl_logs_summary | CRITICAL ERROR: {str(e)}")
 
-def logs_detailed(run_id, process, status, message):
+def logs_detailed(spark, run_id, steps, rows, status, message):
 
     try:
         spark.sql(
             f"""
-            INSERT INTO workspace.logs.etl_logs_summary_detailed (
+            INSERT INTO workspace.logs.etl_logs_detailed (
                 log_run_id,
-                log_process,
+                log_steps,
+                log_no_rows,
                 log_status,
                 log_message
             )
             VALUES (
                 :run_id,
-                :process,
+                :steps,
+                :log_rows,
                 :status,
                 :message
             )  
             """, args = {
                 "run_id": run_id,
-                "process": process,
+                "steps": steps,
+                "log_rows": rows,
                 "status": status,
                 "message": message
             }
