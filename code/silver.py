@@ -3,7 +3,7 @@ from pyspark.sql import SparkSession
 from delta.tables import DeltaTable
 from datetime import datetime
 from silver_config import transformation_config
-from log import logs_summary
+from log import logs_summary, logs_detailed
 from datetime import datetime
 import uuid
 
@@ -41,13 +41,16 @@ def silver_process(spark):
         # Extract + Transform
         # -----------------------------------------
         bronze_transformed_df = spark.sql(item["transformation"])
+        logs_detailed(spark, run_id, "TRANSFORM", bronze_transformed_df.count(), "SUCCESS", f"Transform/Cleaned delta table {item["target_table"]}")
         # -----------------------------------------
         # Load Methods:
         # 1. SCD type 2
         # 2. Overwrite
         # -----------------------------------------
         # SCD tpye 2 ------------------------------
+        logs_detailed(spark, run_id, "Detect load type", bronze_transformed_df.count(), "SUCCESS", f"Identifying load type")
         if item["load_type"] == "scd2":
+            logs_detailed(spark, run_id, "Load type detected", bronze_transformed_df.count(), "SUCCESS", f"Load type {item["load_type"]}")
             print(">>>LOAD TYPE: SCD TYPE 2")
             # -----------------------------------------
             # Add hash
@@ -55,9 +58,11 @@ def silver_process(spark):
             try:
                 bronze_transformed_df = add_hash(
                     bronze_transformed_df,item["compare_columns"])
+                logs_detailed(spark, run_id, "ADD HASH CODE", bronze_transformed_df.count(), "SUCCESS", f"Add Hash code delta table {item["target_table"]}")
 
                 scd_two(
                     spark,
+                    run_id,
                     item["target_table"],
                     bronze_transformed_df,
                     item["table_key"]
@@ -80,10 +85,12 @@ def silver_process(spark):
 
 
         elif item["load_type"] == "overwrite":
+            logs_detailed(spark, run_id, "Load type detected", bronze_transformed_df.count(), "SUCCESS", f"Load type {item["load_type"]}")
             print(">>>LOAD TYPE: OVERWRTIE")
             try:
                 overwrite(
                     spark,
+                    run_id,
                     item["target_table"],
                     bronze_transformed_df
                 )
@@ -95,7 +102,7 @@ def silver_process(spark):
 
 
 
-def scd_two(spark,target_table, bronze_transformed_df, table_key):
+def scd_two(spark, run_id, target_table, bronze_transformed_df, table_key):
     
     # incoming_df - Is a data comming from bronze layer
     # existing_df - Is a data that is already in the silver layer
@@ -132,20 +139,20 @@ def scd_two(spark,target_table, bronze_transformed_df, table_key):
     if not changed_df.isEmpty():
         changes = True
 
-        # 2. INSERT 
-        new_version = (
-            changed_df
-            .withColumn("is_active", F.lit(True))
-            .withColumn("date_activated", F.current_timestamp())
-            .withColumn("date_deactivated", F.lit(None).cast("timestamp"))
-        )
+        # # 2. INSERT 
+        # new_version = (
+        #     changed_df
+        #     .withColumn("is_active", F.lit(True))
+        #     .withColumn("date_activated", F.current_timestamp())
+        #     .withColumn("date_deactivated", F.lit(None).cast("timestamp"))
+        # )
         
-        new_count = new_version.count()
-        print(f"new version: {new_count}")
+        # new_count = new_version.count()
+        # print(f"new version: {new_count}")
 
         # -------------------------------------------------------------------------
 
-
+        logs_detailed(spark, run_id, "EXPIRE DATA", changed_df.count(), "SUCCESS", f"Expired data table {target_table}")
         print(">>>>>CHANGED RECORDS")
         target = DeltaTable.forName(
                 spark,
@@ -164,7 +171,7 @@ def scd_two(spark,target_table, bronze_transformed_df, table_key):
                 }
             ).execute()
         )
-
+        
     # --------------------------------------------------
     # 1. NEW RECORDS
     # --------------------------------------------------
@@ -185,6 +192,7 @@ def scd_two(spark,target_table, bronze_transformed_df, table_key):
 
     if not new_df.isEmpty():
         changes = True
+        logs_detailed(spark, run_id, "INSERT NEW DATA", new_df.count(), "SUCCESS", f"Newly data inserted to {target_table}")
         print(">>>>>NEW RECORDS")
         new_df.write.mode("append").saveAsTable(target_table)
 
@@ -198,15 +206,17 @@ def scd_two(spark,target_table, bronze_transformed_df, table_key):
     # if not unchanged_df.isEmpty():
     #     print(">>>>>NO NEW AND CHANGED RECORDS")
     if changes == False:
+        logs_detailed(spark, run_id, "DATA STATUS", new_df.count(), "SUCCESS", f"No changes for delta table {target_table}")
         print(">>>>>NO CHANGES")
     
 
 
-def overwrite(spark, target_table, transformation):
+def overwrite(spark, run_id, target_table, transformation):
 
     transformation.write \
         .format("delta") \
         .mode("overwrite") \
         .saveAsTable(target_table)
 
+    logs_detailed(spark, run_id, "Overwrite data", transformation.count(), "SUCCESS", f"Overwrite delta table {target_table}")
     print(f">>>>>Overwrite completed: {target_table}")
